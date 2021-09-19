@@ -38,6 +38,10 @@ class MqttPoster():
         self._status = status
 
         self._loop.create_task(self._mqtt.publish(
+            f"{base_mqtt_topic(self._prefix, self._mac, 'switch')}/state",
+            payload=str(status["power"]).encode(), retain=True))
+
+        self._loop.create_task(self._mqtt.publish(
             f"{base_mqtt_topic(self._prefix, self._mac)}-mode/state",
             payload=MODES[status["mode"]].encode(), retain=True))
 
@@ -70,15 +74,25 @@ async def run(loop, mqtt, bt, args):
     await bt.start_notify(UUID, poster)
 
     async with mqtt.unfiltered_messages() as messages:
-        await mqtt.subscribe(f"homeassistant/select/mamaroo/+/command")
+        await mqtt.subscribe(f"{args.prefix}/+/mamaroo/+/command")
         async for message in messages:
             try:
-                entity = message.topic.split('/')[3].split('-')
+                print(message.topic)
+                print(message.payload.decode())
+
+                parts = message.topic.split('/')
+                component = parts[1]
+                if component == "switch":
+                    speed = 1 if message.payload.decode() == '1' else 0
+                    await bt.write_gatt_char(UUID, bt_payload_power(speed))
+                    continue
+
+                entity = parts[3].split('-')
 
                 if len(entity) != 2:
                     continue
 
-                if entity[0].replace('_', ':') != mac:
+                if entity[0].replace('_', ':') != args.MAC:
                     continue
 
                 value = message.payload.decode()
@@ -101,10 +115,22 @@ async def publish_autodiscovery_data(mqtt, args):
         "name": "mamaroo4 infant seat",
         "manufacturer": "4moms",
         "model": "mamaRoo4",
+        "connections": [['mac', args.MAC]]
     }
 
     if args.serial:
         device["identifiers"] = args.serial
+
+    switch_topic = f"{base_mqtt_topic(args.prefix, mac, 'switch')}"
+    await mqtt.publish(f"{switch_topic}/config", json.dumps({
+        "name": f"Mamaroo {mac} Switch",
+        "command_topic": f"{switch_topic}/command",
+        "state_topic": f"{switch_topic}/state",
+        "payload_on": "1",
+        "payload_off": "0",
+        "device": device,
+        "icon": "mdi:rocket-launch",
+    }), retain=True)
 
     mode_topic = f"{base_topic}-mode"
     await mqtt.publish(f"{mode_topic}/config", json.dumps({
@@ -122,6 +148,7 @@ async def publish_autodiscovery_data(mqtt, args):
         "state_topic": f"{speed_topic}/state",
         "options": ["0", "1", "2", "3", "4", "5"],
         "device": device,
+        "icon": "mdi:speedometer",
     }), retain=True)
 
 async def start(loop, args):
