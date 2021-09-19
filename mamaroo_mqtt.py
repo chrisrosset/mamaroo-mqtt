@@ -1,3 +1,6 @@
+#!/usr/bin/env python3.9
+
+import argparse
 import asyncio
 import json
 import sys
@@ -8,8 +11,8 @@ import bleak
 UUID = "622d0101-2416-0fa7-e132-2f1495cc2ce0"
 MODES = ["", "Car Ride", "Kangaroo", "Tree Swing", "Rock-A-Bye", "Wave"]
 
-def base_mqtt_topic(mac, prefix="homeassistant"):
-    return f"{prefix}/select/mamaroo/{mac.replace(':', '_')}"
+def base_mqtt_topic(prefix, mac, component="select"):
+    return f"{prefix}/{component}/mamaroo/{mac.replace(':', '_')}"
 
 class MqttPoster():
     _loop = None
@@ -17,10 +20,11 @@ class MqttPoster():
     _mqtt = None
     _status = None
 
-    def __init__(self, loop, mqtt, mac):
+    def __init__(self, loop, mqtt, mac, prefix):
         self._loop = loop
         self._mac = mac
         self._mqtt = mqtt
+        self._prefix = prefix
 
     def __call__(self, sender, data):
         if data[0] not in [65, 83]:
@@ -34,11 +38,11 @@ class MqttPoster():
         self._status = status
 
         self._loop.create_task(self._mqtt.publish(
-            f"{base_mqtt_topic(self._mac)}-mode/state",
+            f"{base_mqtt_topic(self._prefix, self._mac)}-mode/state",
             payload=MODES[status["mode"]].encode(), retain=True))
 
         self._loop.create_task(self._mqtt.publish(
-            f"{base_mqtt_topic(self._mac)}-speed/state",
+            f"{base_mqtt_topic(self._prefix, self._mac)}-speed/state",
             payload=str(status["speed"]).encode(), retain=True))
 
 def clamp(minimum, maximum, value):
@@ -60,8 +64,8 @@ def validate_command_message(data):
     return ("mode" in data and isinstance(data["mode"], int)
             and "speed" in data and isinstance(data["speed"], int))
 
-async def run(loop, mqtt, bt, mac):
-    poster = MqttPoster(loop, mqtt, mac)
+async def run(loop, mqtt, bt, args):
+    poster = MqttPoster(loop, mqtt, args.MAC, args.prefix)
 
     await bt.start_notify(UUID, poster)
 
@@ -89,15 +93,18 @@ async def run(loop, mqtt, bt, mac):
             except Exception as e:
                 print(e)
 
-async def publish_autodiscovery_data(mqtt, mac):
-    base_topic = f"homeassistant/select/mamaroo/{mac.replace(':', '_')}"
+async def publish_autodiscovery_data(mqtt, args):
+    mac = args.MAC
+    base_topic = base_mqtt_topic(args.prefix, mac)
 
     device = {
         "name": "mamaroo4 infant seat",
         "manufacturer": "4moms",
         "model": "mamaRoo4",
-        "identifiers": "serialnumber",
     }
+
+    if args.serial:
+        device["identifiers"] = args.serial
 
     mode_topic = f"{base_topic}-mode"
     await mqtt.publish(f"{mode_topic}/config", json.dumps({
@@ -117,24 +124,35 @@ async def publish_autodiscovery_data(mqtt, mac):
         "device": device,
     }), retain=True)
 
-async def start(loop, mac):
-    async with asyncio_mqtt.Client("prometheus") as mqtt:
+async def start(loop, args):
+    async with asyncio_mqtt.Client(args.broker) as mqtt:
 
-        await publish_autodiscovery_data(mqtt, mac)
+        await publish_autodiscovery_data(mqtt, args)
 
-        async with bleak.BleakClient(mac, timeout=5, loop=loop) as bt:
+        async with bleak.BleakClient(args.MAC, timeout=5, loop=loop) as bt:
             try:
                 print("Connected")
-                await run(loop, mqtt, bt, mac)
+                await run(loop, mqtt, bt, args)
             except Exception as e:
                 raise e
             finally:
                 bt.disconnect()
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="mamaRoo4 MQTT Adapter")
+    parser.add_argument("--prefix", "-p", type=str,
+                        default="homeassistant", help='MQTT auto-discovery prefix')
+    parser.add_argument("--broker", "-b", type=str,
+                        default="localhost", help='MQTT broker URL')
+    parser.add_argument("--serial", "-s", type=str,
+                        help='Device serial number')
+    parser.add_argument('MAC', type=str, help='mamaRoo4 MAC Address')
+    args = parser.parse_args()
+
     loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(start(loop, sys.argv[1]))
+        loop.run_until_complete(start(loop, args))
     except KeyboardInterrupt:
         print("Exiting")
     except bleak.exc.BleakDBusError as e:
