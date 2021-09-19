@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 import json
-import sys
+import logging
 
 import asyncio_mqtt
 import bleak
@@ -77,13 +77,13 @@ async def run(loop, mqtt, bt, args):
         await mqtt.subscribe(f"{args.prefix}/+/mamaroo/+/command")
         async for message in messages:
             try:
-                print(message.topic)
-                print(message.payload.decode())
+                payload = message.payload.decode()
+                logging.info("Incoming MQTT topic={message.topic} message={payload}")
 
                 parts = message.topic.split('/')
                 component = parts[1]
                 if component == "switch":
-                    speed = 1 if message.payload.decode() == '1' else 0
+                    speed = 1 if payload == '1' else 0
                     await bt.write_gatt_char(UUID, bt_payload_power(speed))
                     continue
 
@@ -95,17 +95,15 @@ async def run(loop, mqtt, bt, args):
                 if entity[0].replace('_', ':') != args.MAC:
                     continue
 
-                value = message.payload.decode()
-
                 if entity[1] == "mode":
-                    await bt.write_gatt_char(UUID, bt_payload_mode(MODES.index(value)))
+                    await bt.write_gatt_char(UUID, bt_payload_mode(MODES.index(payload)))
                 elif entity[1] == "speed":
-                    speed = int(value)
+                    speed = int(payload)
                     await bt.write_gatt_char(UUID, bt_payload_power(speed))
                     await bt.write_gatt_char(UUID, bt_payload_speed(speed))
                     await bt.write_gatt_char(UUID, bt_payload_move(speed))
             except Exception as e:
-                print(e)
+                logging.info(e)
 
 async def publish_autodiscovery_data(mqtt, args):
     mac = args.MAC
@@ -151,21 +149,19 @@ async def publish_autodiscovery_data(mqtt, args):
         "icon": "mdi:speedometer",
     }), retain=True)
 
+    logging.info("Auto-discovery messages published.")
+
 async def start(loop, args):
     async with asyncio_mqtt.Client(args.broker) as mqtt:
-
-        await publish_autodiscovery_data(mqtt, args)
-
+        logging.info("MQTT connection to {} established.".format(args.broker))
         async with bleak.BleakClient(args.MAC, timeout=5, loop=loop) as bt:
-            try:
-                print("Connected")
+                logging.info("Bluetooth connection to {} established.".format(args.MAC))
+                await publish_autodiscovery_data(mqtt, args)
                 await run(loop, mqtt, bt, args)
-            except Exception as e:
-                raise e
-            finally:
-                bt.disconnect()
 
-if __name__ == "__main__":
+def main():
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s',
+                        level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="mamaRoo4 MQTT Adapter")
     parser.add_argument("--prefix", "-p", type=str,
@@ -174,13 +170,22 @@ if __name__ == "__main__":
                         default="localhost", help='MQTT broker URL')
     parser.add_argument("--serial", "-s", type=str,
                         help='Device serial number')
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        default=False, help='Verbose mode')
     parser.add_argument('MAC', type=str, help='mamaRoo4 MAC Address')
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logging.debug("Configuration = {}".format(str(args)))
 
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(start(loop, args))
-    except KeyboardInterrupt:
-        print("Exiting")
     except bleak.exc.BleakDBusError as e:
-        print(e)
+        logging.info(e)
+
+
+if __name__ == "__main__":
+    main()
