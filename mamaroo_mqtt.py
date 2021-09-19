@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import subprocess
 
 import asyncio_mqtt
 import bleak
@@ -182,6 +183,10 @@ def main():
 
     loop = asyncio.get_event_loop()
     try:
+        # If the process crashes it's going to leave an open connection which
+        # will prevent a new instance from establishing a new connection. This
+        # is a quick way to clear this on startup.
+        subprocess.call(['bluetoothctl','disconnect', args.MAC], timeout=10)
         loop.run_until_complete(start(loop, args))
     except bleak.exc.BleakDBusError as e:
         logging.info(e)
