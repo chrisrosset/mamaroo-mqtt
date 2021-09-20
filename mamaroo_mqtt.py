@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import subprocess
@@ -11,6 +12,8 @@ import bleak
 
 UUID = "622d0101-2416-0fa7-e132-2f1495cc2ce0"
 MODES = ["", "Car Ride", "Kangaroo", "Tree Swing", "Rock-A-Bye", "Wave"]
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
 
 def base_mqtt_topic(prefix, mac, component="select"):
     return f"{prefix}/{component}/mamaroo/{mac.replace(':', '_')}"
@@ -70,42 +73,40 @@ def bt_payload_speed(speed):
 def bt_payload_mode(mode):
     return bytearray([0x43, 0x04, clamp(1, 5, mode)])
 
-def validate_command_message(data):
-    return ("mode" in data and isinstance(data["mode"], int)
-            and "speed" in data and isinstance(data["speed"], int))
-
-async def run(mqtt, bt, args):
-    async with mqtt.unfiltered_messages() as messages:
-        await mqtt.subscribe(f"{args.prefix}/+/mamaroo/+/command")
+async def consume_mqtt(messages, bt, args):
+    try:
         async for message in messages:
-            try:
-                payload = message.payload.decode()
-                logging.info("Incoming MQTT topic={} message={}".format(message.topic, payload))
+            payload = message.payload.decode()
+            logging.info("Incoming MQTT topic={} message={}".format(message.topic, payload))
 
-                parts = message.topic.split('/')
-                component = parts[1]
-                if component == "switch":
-                    speed = 1 if payload == '1' else 0
-                    await bt.write_gatt_char(UUID, bt_payload_power(speed))
-                    continue
+            parts = message.topic.split('/')
+            component = parts[1]
+            if component == "switch":
+                speed = 1 if payload == '1' else 0
+                await bt.write_gatt_char(UUID, bt_payload_power(speed))
+                continue
 
-                entity = parts[3].split('-')
+            entity = parts[3].split('-')
 
-                if len(entity) != 2:
-                    continue
+            if len(entity) != 2:
+                continue
 
-                if entity[0].replace('_', ':') != args.MAC:
-                    continue
+            if entity[0].replace('_', ':') != args.MAC:
+                continue
 
-                if entity[1] == "mode":
-                    await bt.write_gatt_char(UUID, bt_payload_mode(MODES.index(payload)))
-                elif entity[1] == "speed":
-                    speed = int(payload)
-                    await bt.write_gatt_char(UUID, bt_payload_power(speed))
-                    await bt.write_gatt_char(UUID, bt_payload_speed(speed))
-                    await bt.write_gatt_char(UUID, bt_payload_move(speed))
-            except Exception as e:
-                logging.info(e)
+            if entity[1] == "mode":
+                await bt.write_gatt_char(UUID, bt_payload_mode(MODES.index(payload)))
+            elif entity[1] == "speed":
+                speed = int(payload)
+                await bt.write_gatt_char(UUID, bt_payload_power(speed))
+                await bt.write_gatt_char(UUID, bt_payload_speed(speed))
+                await bt.write_gatt_char(UUID, bt_payload_move(speed))
+    except asyncio.CancelledError as e:
+        logging.info("Shutting down MQTT consumer on task cancel. e = {}".format(e))
+    except bleak.BleakError as e:
+        logging.error("Bluetooth error encountered while sending data. e = {}".format(e))
+    except Exception as e:
+        logging.error("Unknown error while processing MQTT message. e = {}".format(e))
 
 async def publish_autodiscovery_data(mqtt, args):
 
@@ -162,10 +163,11 @@ async def publish_autodiscovery_data(mqtt, args):
 
     logging.info("Auto-discovery messages published.")
 
-async def main():
-    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s',
-                        level=logging.INFO)
+def on_bt_disconnect(client):
+    logging.warning("Client with address {} got disconnected!".format(client.address))
+    raise Exception(f"{client.address} disconnected")
 
+def create_arg_parser():
     parser = argparse.ArgumentParser(description="mamaRoo4 MQTT Adapter")
     parser.add_argument("--prefix", "-p", type=str,
                         default="homeassistant", help='MQTT auto-discovery prefix')
@@ -176,43 +178,63 @@ async def main():
     parser.add_argument("--verbose", "-v", action="store_true",
                         default=False, help='Verbose mode')
     parser.add_argument('MAC', type=str, help='mamaRoo4 MAC Address')
-    args = parser.parse_args()
+    return parser
+
+async def bluetooth_keep_alive(bt):
+    while bt.is_connected:
+        await asyncio.sleep(15)
+
+    raise Exception("Bluetooth disconnected.")
+
+async def run(args):
+    async with contextlib.AsyncExitStack() as stack:
+        will = asyncio_mqtt.Will(
+            f"{base_mqtt_topic(args.prefix, args.MAC, 'switch')}/availability",
+            payload="offline",
+            retain=True)
+
+        mqtt = asyncio_mqtt.Client(args.broker, will=will)
+        await stack.enter_async_context(mqtt)
+        logging.info("MQTT connection to {} established.".format(args.broker))
+
+        stack.push_async_callback(
+            mqtt.publish, will.topic, payload=will.payload, retain=will.retain)
+
+        bt = bleak.BleakClient(args.MAC, timeout=5)
+        await stack.enter_async_context(bt)
+        logging.info("Bluetooth connection to {} established.".format(args.MAC))
+
+        messages = await stack.enter_async_context(mqtt.unfiltered_messages())
+        mqtt_consumer = asyncio.create_task(consume_mqtt(messages, bt, args))
+
+        poster = MqttPoster(mqtt, args.MAC, args.prefix)
+
+        await asyncio.gather(
+            publish_autodiscovery_data(mqtt, args),
+            mqtt_consumer,
+            mqtt.subscribe(f"{args.prefix}/+/mamaroo/+/command"),
+            bt.start_notify(UUID, poster),
+            bluetooth_keep_alive(bt))
+
+def main():
+    args = create_arg_parser().parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    logging.debug("Configuration = {}".format(str(args)))
+    logging.info("Configuration = {}".format(str(args)))
 
-    loop = asyncio.get_event_loop()
-    try:
-        # If the process crashes it's going to leave an open connection which
-        # will prevent a new instance from establishing a new connection. This
-        # is a quick way to clear this on startup.
-        subprocess.call(['bluetoothctl','disconnect', args.MAC], timeout=10)
+    # If the process crashes it's going to leave an open connection which
+    # will prevent a new instance from establishing a new connection. This
+    # is a quick way to clear this on startup.
+    subprocess.call(['bluetoothctl','disconnect', args.MAC], timeout=10)
 
-        availability_topic = f"{base_mqtt_topic(args.prefix, args.MAC, 'switch')}/availability"
-        last_will = asyncio_mqtt.Will(availability_topic, payload="offline", retain=True)
-
-        async with asyncio_mqtt.Client(args.broker, will=last_will) as mqtt:
-            logging.info("MQTT connection to {} established.".format(args.broker))
-            async with bleak.BleakClient(args.MAC, timeout=5, loop=loop) as bt:
-                logging.info("Bluetooth connection to {} established.".format(args.MAC))
-
-                try:
-                    await publish_autodiscovery_data(mqtt, args)
-                    poster = MqttPoster(mqtt, args.MAC, args.prefix)
-                    await bt.start_notify(UUID, poster)
-                    mqtt_task = asyncio.create_task(run(mqtt, bt, args))
-                    await asyncio.Future()
-                finally:
-                    logging.info("Exception thrown, running cleanup...")
-                    await bt.stop_notify(UUID)
-                    mqtt_task.cancel()
-                    await mqtt.publish(availability_topic, payload="offline", retain=True)
-
-    except bleak.exc.BleakDBusError as e:
-        logging.error(e)
-
+    for i in range(100):
+        try:
+            logging.info("Connection attempt #{}".format(i))
+            asyncio.run(run(args))
+        except bleak.exc.BleakDBusError as e:
+            logging.info("Connection #{} failed. e = {}".format(i, e))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
