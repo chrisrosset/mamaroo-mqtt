@@ -173,6 +173,10 @@ def create_arg_parser():
                         default="homeassistant", help='MQTT auto-discovery prefix')
     parser.add_argument("--broker", "-b", type=str,
                         default="localhost", help='MQTT broker URL')
+    parser.add_argument("--username", "-u", type=str,
+                        default=None, help='MQTT username')
+    parser.add_argument("--password", "-p", type=str,
+                        default=None, help='MQTT password')
     parser.add_argument("--serial", "-s", type=str,
                         help='Device serial number')
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -193,7 +197,8 @@ async def run(args):
             payload="offline",
             retain=True)
 
-        mqtt = asyncio_mqtt.Client(args.broker, will=will)
+        mqtt = asyncio_mqtt.Client(
+            args.broker, will=will, username=args.username, password=args.password)
         await stack.enter_async_context(mqtt)
         logging.info("MQTT connection to {} established.".format(args.broker))
 
