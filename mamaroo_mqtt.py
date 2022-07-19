@@ -169,7 +169,7 @@ def on_bt_disconnect(client):
 
 def create_arg_parser():
     parser = argparse.ArgumentParser(description="mamaRoo4 MQTT Adapter")
-    parser.add_argument("--prefix", "-p", type=str,
+    parser.add_argument("--prefix", type=str,
                         default="homeassistant", help='MQTT auto-discovery prefix')
     parser.add_argument("--broker", "-b", type=str,
                         default="localhost", help='MQTT broker URL')
